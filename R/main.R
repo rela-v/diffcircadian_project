@@ -113,6 +113,10 @@ observed_parameters_A <- cbind(observed_parameters_A, pvalues_A)
 observed_parameters_B <- cbind(observed_parameters_B, pvalues_B)
 observed_parameters_C <- cbind(observed_parameters_C, pvalues_C)
 
+observed_parameters_A <- cbind(Cage=colnames(data_A), observed_parameters_A)
+observed_parameters_B <- cbind(Cage=colnames(data_B), observed_parameters_B)
+observed_parameters_C <- cbind(Cage=colnames(data_C), observed_parameters_C)
+
 # Save the results
 write_csv(observed_parameters_A, "Results/observed_parameters_A.csv")
 write_csv(observed_parameters_B, "Results/observed_parameters_B.csv")
