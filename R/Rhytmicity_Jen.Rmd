@@ -1,0 +1,720 @@
+---
+title: "Rhymicity_Jen"
+output: html_document
+date: "2024-04-25"
+---
+
+```{r setup, include=FALSE}
+library(minpack.lm)
+library(future)
+library(parallel)
+knitr::opts_chunk$set(echo = TRUE)
+setwd("C:\\Users\\Jen\\Desktop\\Burkett_Lab\\R\\nls_lm\\project-1005-rewrite-main\\Data")
+```
+
+```{r}
+cohort_data<-read.csv('C:\\Users\\Jen\\Desktop\\Burkett_Lab\\R\\nls_lm\\project-1005-rewrite-main\\Data\\pheno.csv', row.names=1)
+gene_expression_dataframe<-read.csv('C:\\Users\\Jen\\Desktop\\Burkett_Lab\\R\\nls_lm\\project-1005-rewrite-main\\Data\\data_impute_zeit.csv', row.names=1)
+n.cores <- availableCores()
+num_expressed_genes <- nrow(gene_expression_dataframe)
+```
+
+```{r}
+# Names of rows in gene expression matrix
+Symbols<-colnames(gene_expression_dataframe)
+# Observed dataframe of genes and fitted curve parameters
+# observed_para_c <- data.frame(A=numeric(n_e), phase=numeric(n_e), offset=numeric(n_e), peak=numeric(n_e), R2=numeric(n_e))
+# Time of death (clinical)
+zeitgeber_times<-rownames(gene_expression_dataframe)
+# 1->number of rows: fit the sine curves, assign the output to each row.
+`nls.lm` <- minpack.lm::nls.lm
+```
+
+```{r}
+## Using minpack.lm
+parStartVal <- list(A=3, phase=0, offset=0)
+fitSinCurve <- function(xx, observed, parStart=parStartVal) {
+  # print("fitSinCurve.R: Setting up for fitting.")
+  # function to get predictions
+  getPred <- function(parS, xx) {
+    # Amplitude * sine((1/24 Hz frequency * pi )*(xx + phase)) + offset
+    parS$A * sin((1/12*pi)*(xx+parS$phase))+parS$offset
+  }
+  # function to calculate errors
+  residFun <- function(p, observed, xx) {
+    observed - getPred(p, xx)
+  }
+  # print("fitSinCurve.R: Fitting sinusoid using LM algorithm.")
+  # output of the LM algorithm's sinusoidal fit
+  nls.out <- nls.lm(par=parStartVal, fn = residFun, observed = observed, xx = xx)
+  # get parameters of the fitted function
+  apar <- nls.out$par
+  
+  # assign amplitude
+  A0 <- apar$A
+  # assign the sign (+/-) of the amplitude to 'asign'
+  asign <- sign(A0)
+  
+  # Restrict A > 0
+  A <- A0 * asign
+  
+  # Calculate rounded phase
+  phase <- (apar$phase + ifelse(asign==1,0,12)) %% 24 
+  
+  offset <- apar$offset
+  peak <- (12 * sign(A0) - 6 - phase) %%24
+  if(peak > 18) peak = peak - 24
+  # print("fitSinCurve.R: Calculating statistics.")
+  SSE <- sum(nls.out$fvec^2)
+  SST <- sum((observed - mean(observed))^2)
+  R2 <- 1 - SSE/SST
+  res <- list(A=A, phase=phase, offset=offset, peak=peak, R2=R2)
+  # print("fitSinCurve.R: Protocol complete.")
+  return(res)
+}
+```
+
+```{r}
+generate_observed_parameters <- function(index, num_expressed_genes, gene_expression_dataframe) {
+  out <- fitSinCurve(xx=as.numeric(rownames(gene_expression_dataframe)), observed=as.numeric(gene_expression_dataframe[,index]))
+  out_row <- data.frame(Symbols=Symbols[index], A=out$A, phase=out$phase, offset=out$offset, peak=out$peak, R2=out$R2)
+  return(out_row)
+}
+print('RhythmicityCode.R: Running generate_observed_parameters function in parallel...')
+cl <- makeClusterPSOCK(14)
+# Parallelizing generate_observed_parameters
+clusterExport(cl, c("generate_observed_parameters", "fitSinCurve", "nls.lm", "parStartVal", "Symbols", "num_expressed_genes", "gene_expression_dataframe", "zeitgeber_times"))
+observed_para_c <- do.call(rbind,parLapply(cl, X=1:num_expressed_genes, fun=generate_observed_parameters, num_expressed_genes, gene_expression_dataframe))
+stopCluster(cl)
+
+observed_para_c_sorted <- observed_para_c[order(observed_para_c$R2, decreasing=TRUE),]
+
+print('RhythmicityCode.R: Defining generate_circadian_drawings function...')
+# Generate scatter plots
+top.control <- observed_para_c_sorted[1:4,]
+gene_names <- as.numeric(row.names(top.control))
+number_of_top_genes <- nrow(top.control)
+data_labels <- cohort_data$suicide
+special_information <- "Control"
+system("mkdir -p ./Results/Rhythmicity/PDF")
+```
+```{r}
+#Circadian Drawing
+circadianDrawing <- function(tod, expr, apar, labels, specInfo=NULL){	
+  getPred <- function(parS, xx) {	
+    parS$A * sin(2*pi/24 * (xx + parS$phase)) + parS$offset
+  }
+  
+  geneName <- apar$genes
+  peak <- round(apar$peak)
+  if(peak==18) peak <- -6
+  #pvalue <- signif(apar$pvalue,3)
+  
+  # amain <- paste('PV L3 healthy\n',geneName,':',probeName,'\n','p-value =',apvalue,sep='')
+  amain <- paste(specInfo,', ',geneName,': ','; peak = ',peak,sep='')
+  
+  times <- seq(-6,18,0.1)
+  pred <- getPred(apar,times)
+  
+  labelColor <- as.numeric(factor(labels))
+  
+  plot(tod,expr,col=labelColor, pch=16,cex=2,
+       main=amain,xlim=c(-6,18),
+       xlab='TOD',ylab='Expression')
+  smoothingSpline = smooth.spline(x=times, y=pred, spar=0.35)
+  lines(smoothingSpline,col='red',lwd=4)
+  box(which = "plot", lty = "solid",lwd=3)
+  #legend('topright',legend=unique(labels),col=unique(labelColor),pch=16,cex=2)
+}
+```
+
+```{r}
+generate_circadian_drawings <- function(index, top_control_dataframe, circadian_drawing_function, zeitgeber_times, gene_expression_dataframe, gene_names, data_labels, special_information) {
+  a_gene <- as.character(gene_names[index])
+  fileName <- paste('./Results/Rhythmicity/PDF/Top_Control', a_gene, '.png', sep='')
+  png(fileName)
+  expr=gene_expression_dataframe[,Symbols[index]]
+  expr[is.na(expr)]=0
+  print(expr)
+  circadian_drawing_function(tod=zeitgeber_times, expr=expr, apar=top_control_dataframe[index,], labels=data_labels, specInfo=special_information)
+  dev.off()
+}
+
+print('RhythmicityCode.R: Running generate_circadian_drawings function in parallel...')
+
+
+# Parallelizing generate_circadian_drawings from range 1:nrow(top.control)
+
+lapply(X=1:number_of_top_genes, FUN=generate_circadian_drawings, top_control_dataframe=top.control, circadian_drawing_function=circadianDrawing, zeitgeber_times=zeitgeber_times, gene_expression_dataframe=gene_expression_dataframe, gene_names=gene_names, data_labels=data_labels, special_information=special_information)
+
+
+print('RhythmicityCode.R: Initializing create_shuffled_TOD function...')
+system('mkdir -p ./nullFolder')
+setwd('./nullFolder/')
+groupName <- 'control'
+permutations <- 10 #Alter to 1000 permutations upon completion.
+
+shuffleTOD_df <- data.frame(matrix(ncol=0, nrow=length(zeitgeber_times)))
+```
+```{r}
+create_shuffled_TOD <- function(index, zeitgeber_times) {
+  set.seed(index)
+  return(data.frame(sample(zeitgeber_times)))
+}
+print('RhythmicityCode.R: Running create_shuffled_TOD function in parallel...')
+
+cl <- makeClusterPSOCK(14)
+# Parallelized create_shuffled_TOD function in the range from 1:permutations
+clusterExport(cl, c("create_shuffled_TOD", "permutations", "zeitgeber_times"))
+shuffleTOD_df <- do.call(cbind,parLapply(cl, X=1:permutations, fun=create_shuffled_TOD, zeitgeber_times))
+stopCluster(cl)
+
+print('RhythmicityCode.R: Initializing generate_null_data_filenames function...')
+```
+
+```{r}
+generate_null_data_filenames <- function(index, groupName) {
+  return(paste('null_', groupName, '_', index, '.rdata', sep=''))
+}
+
+print('RhythmicityCode.R: Running generate_null_data_filenames in parallel...')
+cl <- makeClusterPSOCK(14)
+# Parallelizing execution of the generate_null_data_filenames function over the range 1:permutations
+clusterExport(cl, c("generate_null_data_filenames", "groupName"))
+null_para_files <- do.call(rbind, parLapply(cl, X=1:permutations, fun=generate_null_data_filenames, groupName))
+stopCluster(cl)
+
+print('RhythmicityCode.R: Initializing generate_null_data_parameters function...')
+```
+
+```{r}
+generate_null_data_parameters <- function(index, permutation, shuffled_TOD_dataframe, gene_expression_dataframe, curve_fitting_function) {
+  gene_expression_dataframe=as.numeric(unlist(gene_expression_dataframe))
+  out <- curve_fitting_function(xx=as.numeric(shuffled_TOD_dataframe[,permutation]), observed=unlist(gene_expression_dataframe[index]))
+  out_row <- data.frame(out$A, out$phase, out$offset, out$peak, out$R2)
+  return(out_row)
+}
+
+print('RhythmicityCode.R: Running generate_null_data_parameters function in parallel...')
+# Parallelizing the generate_null_data_parameters function across the range 1:num_expressed_genes to append to dataframe null_pare
+for(permutation in 1:permutations) {
+  null_pare <- do.call(rbind, lapply(X=1:num_expressed_genes, FUN=generate_null_data_parameters, permutation, shuffleTOD_df, gene_expression_dataframe, fitSinCurve))
+  colnames(null_pare) <- c("A", "phase", "offset", "peak", "R2")
+  save(null_pare, file=null_para_files[permutation,])
+}
+```
+
+```{r}
+print('RhythmicityCode.R: Initializing collect_variable_from_permutations function...')
+null_pare_A <- data.frame(matrix(0, num_expressed_genes, permutations))
+null_pare_phase <- data.frame(matrix(0, num_expressed_genes, permutations))
+null_pare_offset <- data.frame(matrix(0, num_expressed_genes, permutations))
+null_pare_peak <- data.frame(matrix(0, num_expressed_genes, permutations))
+null_pare_R2 <- data.frame(matrix(0, num_expressed_genes, permutations))
+```
+```{r}
+collect_variable_from_permutations <- function(permutation, variable) {
+  null_pare <- get(load(null_para_files[permutation]))
+  return(null_pare[variable])
+}
+print('RhythmicityCode.R: Running collect_variable_from_permutations function...')
+cl <- makeClusterPSOCK(n.cores)
+# Parallelize the collect_variable_from_permutations function across the range 1:permutations.
+
+for(variable in c('A', 'phase', 'offset', 'peak', 'R2')) {
+  print(variable)
+  clusterExport(cl, c("variable", "collect_variable_from_permutations", "null_para_files", "permutations"))
+  assign(paste('null_para', variable, sep='_'), do.call(cbind, parLapply(cl, X=1:permutations, fun=collect_variable_from_permutations, variable)),envir=.GlobalEnv)
+}
+stopCluster(cl)
+null_para <- list(null_para_A=null_para_A, null_para_phase=null_para_phase, null_para_offset=null_para_offset, null_para_peak=null_para_peak, null_para_R2=null_para_R2)
+null_para_file <- paste('null_', groupName, '.rdata', sep='')
+save(null_para, file=null_para_file)
+setwd('..')
+para_R2_pool <- cbind(observed_para_c$R2, null_para$null_para_R2)
+R2Rank_para <- 1 - (rank(para_R2_pool)[1:length(observed_para_c$R2)] - 0.5)/length(para_R2_pool)
+observed_para_c$pvalue <- R2Rank_para
+observed_para_c$qvalue <- p.adjust(observed_para_c$pvalue, 'BH')
+observed_para_c_sorted <- observed_para_c[order(observed_para_c$pvalue),]
+write.csv(observed_para_c_sorted, "./Results/Rhythmicity/Example_result.csv")
+```
+#AB comparison
+```{r}
+A_index<-which(cohort_data$Dose=="A")
+B_index<-which(cohort_data$Dose=="B")
+C_index<-which(cohort_data$Dose=="C")
+expr.old<-gene_expression_dataframe[,A_index]
+expr.young<-gene_expression_dataframe[,B_index]
+
+
+observed_para_y <- data.frame(genes=colnames(gene_expression_dataframe)[B_index],A=numeric(length(B_index)), phase=numeric(length(B_index)), offset=numeric(length(B_index)), peak=numeric(length(B_index)), R2=numeric(length(B_index)))
+observed_para_o <- data.frame(genes=colnames(gene_expression_dataframe)[A_index],A=numeric(length(A_index)), phase=numeric(length(A_index)), offset=numeric(length(A_index)), peak=numeric(length(A_index)), R2=numeric(length(A_index)))
+
+print('RhythmicityCode.R: Running generate_observed_parameters function for old cohort in parallel...')
+cl <- makeClusterPSOCK(n.cores)
+# Parallelizing generate_observed_parameters
+clusterExport(cl, c("generate_observed_parameters", "fitSinCurve", "nls.lm", "parStartVal", "Symbols", "num_expressed_genes", "expr.old", "tod_o"))
+observed_para_c <- do.call(rbind,parLapply(cl, X=1:length(A_index), fun=generate_observed_parameters, length(A_index), expr.old))
+stopCluster(cl)
+
+print('RhythmicityCode.R: Running generate_observed_parameters function for young cohort in parallel...')
+cl <- makeClusterPSOCK(14)
+# Parallelizing generate_observed_parameters
+clusterExport(cl, c("generate_observed_parameters", "fitSinCurve", "nls.lm", "parStartVal", "Symbols", "num_expressed_genes", "expr.young", "tod_y"))
+observed_para_c <- do.call(rbind,parLapply(cl, X=1:length(B_index), fun=generate_observed_parameters, length(B_index), expr.young))
+stopCluster(cl)
+```
+
+```{r}
+setwd('./nullFolder')
+library(doParallel)
+groupName <- 'A'
+thisData <- expr.old
+
+###REPEAT NULL GENERATION FOR Old###
+
+print('RhythmicityCode.R: Initializing create_shuffled_TOD function for old cohort...')
+groupName <- 'A'
+shuffleTOD_df <- data.frame(matrix(ncol=0, nrow=nrow(gene_expression_dataframe)))
+
+print('RhythmicityCode.R: Running create_shuffled_TOD function in parallel...')
+
+cl <- makeClusterPSOCK(14)
+# Parallelized create_shuffled_TOD function in the range from 1:permutations for old cohort
+clusterExport(cl, c("create_shuffled_TOD", "permutations", "expr.old"))
+shuffleTOD_df <- do.call(cbind,parLapply(cl, X=1:permutations, fun=create_shuffled_TOD, expr.old))
+stopCluster(cl)
+
+print('RhythmicityCode.R: Running generate_null_data_filenames in parallel for old cohort...')
+cl <- makeClusterPSOCK(14)
+# Parallelizing execution of the generate_null_data_filenames function over the range 1:permutations
+clusterExport(cl, c("generate_null_data_filenames", "groupName"))
+null_para_files <- do.call(rbind, parLapply(cl, X=1:permutations, fun=generate_null_data_filenames, groupName))
+stopCluster(cl)
+
+print('RhythmicityCode.R: Running generate_null_data_parameters function in parallel for old cohort...')
+cl <- makeClusterPSOCK(14)
+# Parallelizing the generate_null_data_parameters function across the range 1:num_expressed_genes to append to dataframe null_pare
+clusterExport(cl, c("generate_null_data_parameters", "parStartVal", "shuffleTOD_df", "nls.lm", "expr.old", "fitSinCurve"))
+for(permutation in 1:permutations) {
+  clusterExport(cl, "permutation")
+  null_pare <- do.call(rbind, parLapply(cl, X=1:num_expressed_genes, fun=generate_null_data_parameters, permutations, shuffleTOD_df, expr.old, fitSinCurve))
+  colnames(null_pare) <- c("A", "phase", "offset", "peak", "R2")
+  save(null_pare, file=null_para_files[permutation,])
+}
+stopCluster(cl)
+
+print('RhythmicityCode.R: Running collect_variable_from_permutations function for old cohort...')
+cl <- makeClusterPSOCK(14)
+# Parallelize the collect_variable_from_permutations function across the range 1:permutations.
+
+for(variable in c('A', 'phase', 'offset', 'peak', 'R2')) {
+  print(variable)
+  clusterExport(cl, c("variable", "collect_variable_from_permutations", "null_para_files", "permutations"))
+  assign(paste('null_para', variable, sep='_'), do.call(cbind, parLapply(cl, X=1:permutations, fun=collect_variable_from_permutations, variable)),envir=.GlobalEnv)
+}
+stopCluster(cl)
+null_para <- list(null_para_A=null_para_A, null_para_phase=null_para_phase, null_para_offset=null_para_offset, null_para_peak=null_para_peak, null_para_R2=null_para_R2)
+null_para_file <- paste('null_', groupName, '.rdata', sep='')
+save(null_para, file=null_para_file)
+```
+
+```{r}
+groupName <- 'B'
+thisData <- expr.young
+
+###REPEAT NULL GENERATION FOR Old###
+
+print('RhythmicityCode.R: Initializing create_shuffled_TOD function for old cohort...')
+groupName <- 'B'
+shuffleTOD_df <- data.frame(matrix(ncol=0, nrow=nrow(gene_expression_dataframe)))
+
+print('RhythmicityCode.R: Running create_shuffled_TOD function in parallel...')
+
+cl <- makeClusterPSOCK(14)
+# Parallelized create_shuffled_TOD function in the range from 1:permutations for young cohort
+clusterExport(cl, c("create_shuffled_TOD", "permutations", "expr.young"))
+shuffleTOD_df <- do.call(cbind,parLapply(cl, X=1:permutations, fun=create_shuffled_TOD, expr.young))
+stopCluster(cl)
+
+print('RhythmicityCode.R: Running generate_null_data_filenames in parallel for young cohort...')
+cl <- makeClusterPSOCK(14)
+# Parallelizing execution of the generate_null_data_filenames function over the range 1:permutations
+clusterExport(cl, c("generate_null_data_filenames", "groupName"))
+null_para_files <- do.call(rbind, parLapply(cl, X=1:permutations, fun=generate_null_data_filenames, groupName))
+stopCluster(cl)
+
+print('RhythmicityCode.R: Running generate_null_data_parameters function in parallel for young cohort...')
+cl <- makeClusterPSOCK(14)
+# Parallelizing the generate_null_data_parameters function across the range 1:num_expressed_genes to append to dataframe null_pare
+clusterExport(cl, c("generate_null_data_parameters", "parStartVal", "shuffleTOD_df", "nls.lm", "expr.young", "fitSinCurve"))
+for(permutation in 1:permutations) {
+  clusterExport(cl, "permutation")
+  null_pare <- do.call(rbind, parLapply(cl, X=1:num_expressed_genes, fun=generate_null_data_parameters, permutations, shuffleTOD_df, expr.young, fitSinCurve))
+  colnames(null_pare) <- c("A", "phase", "offset", "peak", "R2")
+  save(null_pare, file=null_para_files[permutation,])
+}
+stopCluster(cl)
+
+print('RhythmicityCode.R: Running collect_variable_from_permutations function for young cohort...')
+cl <- makeClusterPSOCK(14)
+# Parallelize the collect_variable_from_permutations function across the range 1:permutations.
+
+for(variable in c('A', 'phase', 'offset', 'peak', 'R2')) {
+  print(variable)
+  clusterExport(cl, c("variable", "collect_variable_from_permutations", "null_para_files", "permutations"))
+  assign(paste('null_para', variable, sep='_'), do.call(cbind, parLapply(cl, X=1:permutations, fun=collect_variable_from_permutations, variable)),envir=.GlobalEnv)
+}
+stopCluster(cl)
+null_para <- list(null_para_A=null_para_A, null_para_phase=null_para_phase, null_para_offset=null_para_offset, null_para_peak=null_para_peak, null_para_R2=null_para_R2)
+null_para_file <- paste('null_', groupName, '.rdata', sep='')
+save(null_para, file=null_para_file)
+```
+
+```{r}
+setwd("C:\\Users\\Jen\\Desktop\\Burkett_Lab\\R\\nls_lm\\project-1005-rewrite-main\\nullFolder")
+compareGroups <- function(permutation, group1='B', group2='A', variable) {
+  group1_ret <- unlist(get(load(paste('./null_', group1, '_', permutation, '.rdata', sep='')))[variable])
+  group2_ret <- unlist(get(load(paste('./null_', group2, '_', permutation, '.rdata', sep='')))[variable])
+  group_rets <- t.test(group2_ret[which(is.finite(group2_ret)==TRUE)],group1_ret[which(is.finite(group1_ret)==TRUE)])$p.value
+  
+  return(group_rets)
+}
+
+cl <- makeClusterPSOCK(14)
+for(variable in c('R2', 'A', 'phase', 'offset')) {
+  print(variable)
+  clusterExport(cl, c("variable", "compareGroups", "permutations"))
+  assign(paste(variable, 'PshiftNULL', sep=''), do.call(cbind, parLapply(cl, X=1:permutations, fun=compareGroups, group1='old', group2='young', variable=variable)))
+}
+stopCluster(cl)
+```
+
+```{r}
+result2<-data.frame(cbind(R2PshiftNULL, APshiftNULL, phasePshiftNULL, offsetPshiftNULL))
+#result2_sorted<-result2[order(result2$R2PshiftNULL, decreasing = FALSE), ]
+setwd("../")
+write.csv(result2, "./Results/Rhythmicity/Example_Result2_AB.csv")
+
+print('RhythmicityCode.R: Routine complete.')
+```
+
+#BC comparison
+```{r}
+B_index<-which(cohort_data$Dose=="B")
+C_index<-which(cohort_data$Dose=="C")
+expr.old<-gene_expression_dataframe[,B_index]
+expr.young<-gene_expression_dataframe[,C_index]
+
+
+observed_para_y <- data.frame(genes=colnames(gene_expression_dataframe)[C_index],A=numeric(length(C_index)), phase=numeric(length(C_index)), offset=numeric(length(C_index)), peak=numeric(length(C_index)), R2=numeric(length(C_index)))
+observed_para_o <- data.frame(genes=colnames(gene_expression_dataframe)[B_index],A=numeric(length(B_index)), phase=numeric(length(B_index)), offset=numeric(length(B_index)), peak=numeric(length(B_index)), R2=numeric(length(B_index)))
+
+print('RhythmicityCode.R: Running generate_observed_parameters function for old cohort in parallel...')
+cl <- makeClusterPSOCK(n.cores)
+# Parallelizing generate_observed_parameters
+clusterExport(cl, c("generate_observed_parameters", "fitSinCurve", "nls.lm", "parStartVal", "Symbols", "num_expressed_genes", "expr.old", "tod_o"))
+observed_para_c <- do.call(rbind,parLapply(cl, X=1:length(B_index), fun=generate_observed_parameters, length(B_index), expr.old))
+stopCluster(cl)
+
+print('RhythmicityCode.R: Running generate_observed_parameters function for young cohort in parallel...')
+cl <- makeClusterPSOCK(14)
+# Parallelizing generate_observed_parameters
+clusterExport(cl, c("generate_observed_parameters", "fitSinCurve", "nls.lm", "parStartVal", "Symbols", "num_expressed_genes", "expr.young", "tod_y"))
+observed_para_c <- do.call(rbind,parLapply(cl, X=1:length(C_index), fun=generate_observed_parameters, length(C_index), expr.young))
+stopCluster(cl)
+```
+
+```{r}
+setwd('./nullFolder')
+library(doParallel)
+groupName <- 'B'
+thisData <- expr.old
+
+###REPEAT NULL GENERATION FOR Old###
+
+print('RhythmicityCode.R: Initializing create_shuffled_TOD function for old cohort...')
+groupName <- 'B'
+shuffleTOD_df <- data.frame(matrix(ncol=0, nrow=nrow(gene_expression_dataframe)))
+
+print('RhythmicityCode.R: Running create_shuffled_TOD function in parallel...')
+
+cl <- makeClusterPSOCK(14)
+# Parallelized create_shuffled_TOD function in the range from 1:permutations for old cohort
+clusterExport(cl, c("create_shuffled_TOD", "permutations", "expr.old"))
+shuffleTOD_df <- do.call(cbind,parLapply(cl, X=1:permutations, fun=create_shuffled_TOD, expr.old))
+stopCluster(cl)
+
+print('RhythmicityCode.R: Running generate_null_data_filenames in parallel for old cohort...')
+cl <- makeClusterPSOCK(14)
+# Parallelizing execution of the generate_null_data_filenames function over the range 1:permutations
+clusterExport(cl, c("generate_null_data_filenames", "groupName"))
+null_para_files <- do.call(rbind, parLapply(cl, X=1:permutations, fun=generate_null_data_filenames, groupName))
+stopCluster(cl)
+
+print('RhythmicityCode.R: Running generate_null_data_parameters function in parallel for old cohort...')
+cl <- makeClusterPSOCK(14)
+# Parallelizing the generate_null_data_parameters function across the range 1:num_expressed_genes to append to dataframe null_pare
+clusterExport(cl, c("generate_null_data_parameters", "parStartVal", "shuffleTOD_df", "nls.lm", "expr.old", "fitSinCurve"))
+for(permutation in 1:permutations) {
+  clusterExport(cl, "permutation")
+  null_pare <- do.call(rbind, parLapply(cl, X=1:num_expressed_genes, fun=generate_null_data_parameters, permutations, shuffleTOD_df, expr.old, fitSinCurve))
+  colnames(null_pare) <- c("A", "phase", "offset", "peak", "R2")
+  save(null_pare, file=null_para_files[permutation,])
+}
+stopCluster(cl)
+
+print('RhythmicityCode.R: Running collect_variable_from_permutations function for old cohort...')
+cl <- makeClusterPSOCK(14)
+# Parallelize the collect_variable_from_permutations function across the range 1:permutations.
+
+for(variable in c('A', 'phase', 'offset', 'peak', 'R2')) {
+  print(variable)
+  clusterExport(cl, c("variable", "collect_variable_from_permutations", "null_para_files", "permutations"))
+  assign(paste('null_para', variable, sep='_'), do.call(cbind, parLapply(cl, X=1:permutations, fun=collect_variable_from_permutations, variable)),envir=.GlobalEnv)
+}
+stopCluster(cl)
+null_para <- list(null_para_A=null_para_A, null_para_phase=null_para_phase, null_para_offset=null_para_offset, null_para_peak=null_para_peak, null_para_R2=null_para_R2)
+null_para_file <- paste('null_', groupName, '.rdata', sep='')
+save(null_para, file=null_para_file)
+```
+
+```{r}
+groupName <- 'C'
+thisData <- expr.young
+
+###REPEAT NULL GENERATION FOR Old###
+
+print('RhythmicityCode.R: Initializing create_shuffled_TOD function for old cohort...')
+groupName <- 'C'
+shuffleTOD_df <- data.frame(matrix(ncol=0, nrow=nrow(gene_expression_dataframe)))
+
+print('RhythmicityCode.R: Running create_shuffled_TOD function in parallel...')
+
+cl <- makeClusterPSOCK(14)
+# Parallelized create_shuffled_TOD function in the range from 1:permutations for young cohort
+clusterExport(cl, c("create_shuffled_TOD", "permutations", "expr.young"))
+shuffleTOD_df <- do.call(cbind,parLapply(cl, X=1:permutations, fun=create_shuffled_TOD, expr.young))
+stopCluster(cl)
+
+print('RhythmicityCode.R: Running generate_null_data_filenames in parallel for young cohort...')
+cl <- makeClusterPSOCK(14)
+# Parallelizing execution of the generate_null_data_filenames function over the range 1:permutations
+clusterExport(cl, c("generate_null_data_filenames", "groupName"))
+null_para_files <- do.call(rbind, parLapply(cl, X=1:permutations, fun=generate_null_data_filenames, groupName))
+stopCluster(cl)
+
+print('RhythmicityCode.R: Running generate_null_data_parameters function in parallel for young cohort...')
+cl <- makeClusterPSOCK(14)
+# Parallelizing the generate_null_data_parameters function across the range 1:num_expressed_genes to append to dataframe null_pare
+clusterExport(cl, c("generate_null_data_parameters", "parStartVal", "shuffleTOD_df", "nls.lm", "expr.young", "fitSinCurve"))
+for(permutation in 1:permutations) {
+  clusterExport(cl, "permutation")
+  null_pare <- do.call(rbind, parLapply(cl, X=1:num_expressed_genes, fun=generate_null_data_parameters, permutations, shuffleTOD_df, expr.young, fitSinCurve))
+  colnames(null_pare) <- c("A", "phase", "offset", "peak", "R2")
+  save(null_pare, file=null_para_files[permutation,])
+}
+stopCluster(cl)
+
+print('RhythmicityCode.R: Running collect_variable_from_permutations function for young cohort...')
+cl <- makeClusterPSOCK(14)
+# Parallelize the collect_variable_from_permutations function across the range 1:permutations.
+
+for(variable in c('A', 'phase', 'offset', 'peak', 'R2')) {
+  print(variable)
+  clusterExport(cl, c("variable", "collect_variable_from_permutations", "null_para_files", "permutations"))
+  assign(paste('null_para', variable, sep='_'), do.call(cbind, parLapply(cl, X=1:permutations, fun=collect_variable_from_permutations, variable)),envir=.GlobalEnv)
+}
+stopCluster(cl)
+null_para <- list(null_para_A=null_para_A, null_para_phase=null_para_phase, null_para_offset=null_para_offset, null_para_peak=null_para_peak, null_para_R2=null_para_R2)
+null_para_file <- paste('null_', groupName, '.rdata', sep='')
+save(null_para, file=null_para_file)
+```
+
+```{r}
+setwd("C:\\Users\\Jen\\Desktop\\Burkett_Lab\\R\\nls_lm\\project-1005-rewrite-main\\nullFolder")
+compareGroups <- function(permutation, group1='B', group2='A', variable) {
+  group1_ret <- unlist(get(load(paste('./null_', group1, '_', permutation, '.rdata', sep='')))[variable])
+  group2_ret <- unlist(get(load(paste('./null_', group2, '_', permutation, '.rdata', sep='')))[variable])
+  group_rets <- t.test(group2_ret[which(is.finite(group2_ret)==TRUE)],group1_ret[which(is.finite(group1_ret)==TRUE)])$p.value
+  
+  return(group_rets)
+}
+
+cl <- makeClusterPSOCK(14)
+for(variable in c('R2', 'A', 'phase', 'offset')) {
+  print(variable)
+  clusterExport(cl, c("variable", "compareGroups", "permutations"))
+  assign(paste(variable, 'PshiftNULL', sep=''), do.call(cbind, parLapply(cl, X=1:permutations, fun=compareGroups, group1='old', group2='young', variable=variable)))
+}
+stopCluster(cl)
+```
+
+```{r}
+result2<-data.frame(cbind(R2PshiftNULL, APshiftNULL, phasePshiftNULL, offsetPshiftNULL))
+#result2_sorted<-result2[order(result2$R2PshiftNULL, decreasing = FALSE), ]
+setwd("../")
+write.csv(result2, "./Results/Rhythmicity/Example_Result2_BC.csv")
+
+print('RhythmicityCode.R: Routine complete.')
+```
+
+#AC comparison
+```{r}
+A_index<-which(cohort_data$Dose=="A")
+C_index<-which(cohort_data$Dose=="C")
+expr.old<-gene_expression_dataframe[,A_index]
+expr.young<-gene_expression_dataframe[,C_index]
+
+
+observed_para_y <- data.frame(genes=colnames(gene_expression_dataframe)[C_index],A=numeric(length(C_index)), phase=numeric(length(C_index)), offset=numeric(length(C_index)), peak=numeric(length(C_index)), R2=numeric(length(C_index)))
+observed_para_o <- data.frame(genes=colnames(gene_expression_dataframe)[A_index],A=numeric(length(A_index)), phase=numeric(length(A_index)), offset=numeric(length(A_index)), peak=numeric(length(A_index)), R2=numeric(length(A_index)))
+
+print('RhythmicityCode.R: Running generate_observed_parameters function for old cohort in parallel...')
+cl <- makeClusterPSOCK(n.cores)
+# Parallelizing generate_observed_parameters
+clusterExport(cl, c("generate_observed_parameters", "fitSinCurve", "nls.lm", "parStartVal", "Symbols", "num_expressed_genes", "expr.old", "tod_o"))
+observed_para_c <- do.call(rbind,parLapply(cl, X=1:length(A_index), fun=generate_observed_parameters, length(A_index), expr.old))
+stopCluster(cl)
+
+print('RhythmicityCode.R: Running generate_observed_parameters function for young cohort in parallel...')
+cl <- makeClusterPSOCK(14)
+# Parallelizing generate_observed_parameters
+clusterExport(cl, c("generate_observed_parameters", "fitSinCurve", "nls.lm", "parStartVal", "Symbols", "num_expressed_genes", "expr.young", "tod_y"))
+observed_para_c <- do.call(rbind,parLapply(cl, X=1:length(C_index), fun=generate_observed_parameters, length(C_index), expr.young))
+stopCluster(cl)
+```
+
+```{r}
+setwd('./nullFolder')
+library(doParallel)
+groupName <- 'A'
+thisData <- expr.old
+
+###REPEAT NULL GENERATION FOR Old###
+
+print('RhythmicityCode.R: Initializing create_shuffled_TOD function for old cohort...')
+groupName <- 'A'
+shuffleTOD_df <- data.frame(matrix(ncol=0, nrow=nrow(gene_expression_dataframe)))
+
+print('RhythmicityCode.R: Running create_shuffled_TOD function in parallel...')
+
+cl <- makeClusterPSOCK(14)
+# Parallelized create_shuffled_TOD function in the range from 1:permutations for old cohort
+clusterExport(cl, c("create_shuffled_TOD", "permutations", "expr.old"))
+shuffleTOD_df <- do.call(cbind,parLapply(cl, X=1:permutations, fun=create_shuffled_TOD, expr.old))
+stopCluster(cl)
+
+print('RhythmicityCode.R: Running generate_null_data_filenames in parallel for old cohort...')
+cl <- makeClusterPSOCK(14)
+# Parallelizing execution of the generate_null_data_filenames function over the range 1:permutations
+clusterExport(cl, c("generate_null_data_filenames", "groupName"))
+null_para_files <- do.call(rbind, parLapply(cl, X=1:permutations, fun=generate_null_data_filenames, groupName))
+stopCluster(cl)
+
+print('RhythmicityCode.R: Running generate_null_data_parameters function in parallel for old cohort...')
+cl <- makeClusterPSOCK(14)
+# Parallelizing the generate_null_data_parameters function across the range 1:num_expressed_genes to append to dataframe null_pare
+clusterExport(cl, c("generate_null_data_parameters", "parStartVal", "shuffleTOD_df", "nls.lm", "expr.old", "fitSinCurve"))
+for(permutation in 1:permutations) {
+  clusterExport(cl, "permutation")
+  null_pare <- do.call(rbind, parLapply(cl, X=1:num_expressed_genes, fun=generate_null_data_parameters, permutations, shuffleTOD_df, expr.old, fitSinCurve))
+  colnames(null_pare) <- c("A", "phase", "offset", "peak", "R2")
+  save(null_pare, file=null_para_files[permutation,])
+}
+stopCluster(cl)
+
+print('RhythmicityCode.R: Running collect_variable_from_permutations function for old cohort...')
+cl <- makeClusterPSOCK(14)
+# Parallelize the collect_variable_from_permutations function across the range 1:permutations.
+
+for(variable in c('A', 'phase', 'offset', 'peak', 'R2')) {
+  print(variable)
+  clusterExport(cl, c("variable", "collect_variable_from_permutations", "null_para_files", "permutations"))
+  assign(paste('null_para', variable, sep='_'), do.call(cbind, parLapply(cl, X=1:permutations, fun=collect_variable_from_permutations, variable)),envir=.GlobalEnv)
+}
+stopCluster(cl)
+null_para <- list(null_para_A=null_para_A, null_para_phase=null_para_phase, null_para_offset=null_para_offset, null_para_peak=null_para_peak, null_para_R2=null_para_R2)
+null_para_file <- paste('null_', groupName, '.rdata', sep='')
+save(null_para, file=null_para_file)
+```
+
+```{r}
+groupName <- 'C'
+thisData <- expr.young
+
+###REPEAT NULL GENERATION FOR Old###
+
+print('RhythmicityCode.R: Initializing create_shuffled_TOD function for old cohort...')
+groupName <- 'C'
+shuffleTOD_df <- data.frame(matrix(ncol=0, nrow=nrow(gene_expression_dataframe)))
+
+print('RhythmicityCode.R: Running create_shuffled_TOD function in parallel...')
+
+cl <- makeClusterPSOCK(14)
+# Parallelized create_shuffled_TOD function in the range from 1:permutations for young cohort
+clusterExport(cl, c("create_shuffled_TOD", "permutations", "expr.young"))
+shuffleTOD_df <- do.call(cbind,parLapply(cl, X=1:permutations, fun=create_shuffled_TOD, expr.young))
+stopCluster(cl)
+
+print('RhythmicityCode.R: Running generate_null_data_filenames in parallel for young cohort...')
+cl <- makeClusterPSOCK(14)
+# Parallelizing execution of the generate_null_data_filenames function over the range 1:permutations
+clusterExport(cl, c("generate_null_data_filenames", "groupName"))
+null_para_files <- do.call(rbind, parLapply(cl, X=1:permutations, fun=generate_null_data_filenames, groupName))
+stopCluster(cl)
+
+print('RhythmicityCode.R: Running generate_null_data_parameters function in parallel for young cohort...')
+cl <- makeClusterPSOCK(14)
+# Parallelizing the generate_null_data_parameters function across the range 1:num_expressed_genes to append to dataframe null_pare
+clusterExport(cl, c("generate_null_data_parameters", "parStartVal", "shuffleTOD_df", "nls.lm", "expr.young", "fitSinCurve"))
+for(permutation in 1:permutations) {
+  clusterExport(cl, "permutation")
+  null_pare <- do.call(rbind, parLapply(cl, X=1:num_expressed_genes, fun=generate_null_data_parameters, permutations, shuffleTOD_df, expr.young, fitSinCurve))
+  colnames(null_pare) <- c("A", "phase", "offset", "peak", "R2")
+  save(null_pare, file=null_para_files[permutation,])
+}
+stopCluster(cl)
+
+print('RhythmicityCode.R: Running collect_variable_from_permutations function for young cohort...')
+cl <- makeClusterPSOCK(14)
+# Parallelize the collect_variable_from_permutations function across the range 1:permutations.
+
+for(variable in c('A', 'phase', 'offset', 'peak', 'R2')) {
+  print(variable)
+  clusterExport(cl, c("variable", "collect_variable_from_permutations", "null_para_files", "permutations"))
+  assign(paste('null_para', variable, sep='_'), do.call(cbind, parLapply(cl, X=1:permutations, fun=collect_variable_from_permutations, variable)),envir=.GlobalEnv)
+}
+stopCluster(cl)
+null_para <- list(null_para_A=null_para_A, null_para_phase=null_para_phase, null_para_offset=null_para_offset, null_para_peak=null_para_peak, null_para_R2=null_para_R2)
+null_para_file <- paste('null_', groupName, '.rdata', sep='')
+save(null_para, file=null_para_file)
+```
+
+```{r}
+setwd("C:\\Users\\Jen\\Desktop\\Burkett_Lab\\R\\nls_lm\\project-1005-rewrite-main\\nullFolder")
+compareGroups <- function(permutation, group1='C', group2='A', variable) {
+  group1_ret <- unlist(get(load(paste('./null_', group1, '_', permutation, '.rdata', sep='')))[variable])
+  group2_ret <- unlist(get(load(paste('./null_', group2, '_', permutation, '.rdata', sep='')))[variable])
+  group_rets <- t.test(group2_ret[which(is.finite(group2_ret)==TRUE)],group1_ret[which(is.finite(group1_ret)==TRUE)])$p.value
+  
+  return(group_rets)
+}
+
+cl <- makeClusterPSOCK(14)
+for(variable in c('R2', 'A', 'phase', 'offset')) {
+  print(variable)
+  clusterExport(cl, c("variable", "compareGroups", "permutations"))
+  assign(paste(variable, 'PshiftNULL', sep=''), do.call(cbind, parLapply(cl, X=1:permutations, fun=compareGroups, group1='old', group2='young', variable=variable)))
+}
+stopCluster(cl)
+```
+
+```{r}
+result2<-data.frame(cbind(R2PshiftNULL, APshiftNULL, phasePshiftNULL, offsetPshiftNULL))
+#result2_sorted<-result2[order(result2$R2PshiftNULL, decreasing = FALSE), ]
+setwd("../")
+write.csv(result2, "./Results/Rhythmicity/Example_Result2_AC.csv")
+
+print('RhythmicityCode.R: Routine complete.')
+```
