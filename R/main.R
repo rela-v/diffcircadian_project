@@ -6,6 +6,7 @@ require(parallel)
 require(parallelly)
 require(lmtest)
 require(tidyverse)
+library(ggplot2)
 
 # Load the required functions
 fitSinCurve <- function(xx, observed, parStart = list(A=3, phase=0, offset=0)) {
@@ -46,7 +47,11 @@ generate_observed_parameters <- function(zeitgeber_times, observed) {
   return(observed_parameters)
 }
 
-ciradianDrawing <- function(tod, expr, apar, labels, specInfo=NULL) {
+circadianDrawing <- function(tod, expr, apar, labels, specInfo=NULL) {
+  getPred <- function(parS, xx) {
+    parS$A * sin((1/12*pi)*(xx+parS$phase)) + parS$offset
+  }
+
   geneName <- apar$geneName
   peak <- round(apar$peak)
   if(peak==18) peak <- -6
@@ -137,3 +142,85 @@ for (var in c("A", "phase", "offset", "peak", "R2")) {
   print(paste("P-value for difference in", var, "between B and C:", p_value_B_C))
 }
 
+plot_circadian <- function(data, observed_parameters, zeitgeber_times, cage_index) {
+  cage <- colnames(data)[cage_index]
+  print(cage)
+  
+  # Extract sine curve parameters from observed_parameters
+  parameters <- observed_parameters[observed_parameters$Cage == cage, ]
+  print(parameters)
+  amp <- unlist(as.numeric(parameters$A))
+  phase <- unlist(as.numeric(parameters$phase))
+  offset <- unlist(as.numeric(parameters$offset))
+  print(amp)
+  print(phase)
+  print(offset)
+  
+  df <- data.frame(zeitgeber_times = zeitgeber_times, activity_level = data[[cage]])
+  
+  # Custom formula for sine curve with observed parameters
+  
+  # Plot scatterplot with x and y
+  p <- ggplot(df, aes(x = zeitgeber_times, y = activity_level)) + 
+    geom_point() +
+    # Add a sine curve based on observed parameters
+    stat_function(fun = function(x) amp * sin((1/12*pi)*(x+phase)) + offset, color = "red") +
+    labs(title = paste("Circadian pattern of", cage, "expression"), x = "Zeitgeber time (hours)", y = "Activity level") +
+    theme_grey()
+  
+  return(p)
+}
+
+# The goal now is to find ultradian (period of 2-6 hours) and circadian (period of 10-14 hours) rhythms in the data
+# We will then plot the circadian and ultradian rhythms
+
+# Fourier transform
+install.packages('TSA')
+library(TSA)
+
+
+
+# Do fft for all cages in data_A then take the average
+# Get fft
+calculate_col_periodogram <- function(col_index, df) {
+  column <- df[col_index]
+  col_periodogram <- periodogram(column)
+  return(col_periodogram$spec)
+}
+
+calculate_df_freq <- function(df) {
+  column <- df[1]
+  col_periodogram <- periodogram(column)
+  return(col_periodogram$freq)
+}
+
+
+get_fft_plot <- function(data, name) {
+  fft_data <- do.call(cbind, lapply(1:ncol(data), calculate_col_periodogram, df=data))
+  fft_data_amp <- rowMeans(fft_data)
+  fft_data_freq <- calculate_df_freq(data)
+  sample_rate <- 1/1800
+  fft_data_freq <- sample_rate * fft_data_freq
+  png(paste0('Results/fft_', name, '.png'))
+  plot(fft_data_freq, fft_data_amp, type = "n", xlab = "Frequency", ylab = "Amplitude", 
+     main = "Frequency Spectrum")
+
+  # Draw thin bars as lines
+  segments(x0 = fft_data_freq, y0 = 0, x1 = fft_data_freq, y1 = fft_data_amp, lwd = 1)
+  dev.off()
+  fft_data <- rowMeans(fft_data)
+  fft_period <- ((1/fft_data_freq)/(60*60))
+  fft_data <- data.frame(fft_data_freq, fft_data, fft_period)
+  print(fft_data)
+  write.csv(fft_data, paste0('Results/fft_', name, '.csv'))
+  # print(paste("Maximized Amplitude Ultradian Frequency for", name, ":", ultradian_max))
+  # print(paste("Maximized Amplitude Circadian Frequency for", name, ":", circadian_max))
+  # print(paste("Maximized Amplitude Ultradian Period for", name, ":", ultradian_max_period))
+  # print(paste("Maximized Amplitude Circadian Period for", name, ":", circadian_max_period))
+}
+
+get_fft_plot(data_A, 'data_A')
+get_fft_plot(data_B, 'data_B')
+get_fft_plot(data_C, 'data_C')
+
+# Create a function which will seek to find the circadian and ultradian rhythms in the data
